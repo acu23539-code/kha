@@ -1,0 +1,710 @@
+local UIS = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+-- // ARCHIVOS DE GUARDADO
+local fileFlash = "StickFlashPos.json"
+local fileHelper = "StickHelperPos.json"
+local fileAntiSentry = "StickAntiSentryState.json"
+local fileDesyncHybrid = "DesyncPos_Config.json"
+local fileMenuSBtn = "StickMenuSBtnPos.json" -- Guardar posición del botón S
+
+-- NUEVOS ARCHIVOS PARA GUARDAR EL ESTADO DE MINIMIZADO (TRUE = MINIMIZADO)
+local fileFlashMin = "StickFlashMinState.json"
+local fileHelperMin = "StickHelperMinState.json"
+
+-- // VARIABLES COMPARTIDAS / GLOBALES
+local deathCoords = CFrame.new(1000003.56, 999999.69, 8.17)
+
+-- // VARIABLES FLASH TP
+local sliderValue = 0.91
+local flashEnabled = true
+local draggingSlider = false
+
+-- // VARIABLES STICK BOOSTER
+local SPEED = 29.5 
+local boosterEnabled = false
+local speedConn
+
+-- // VARIABLES STICK HELPER
+local Connections = {}
+local Enabled = { 
+    AntiRagdoll = true,
+    AntiSentry = false,
+    AutoKick = true
+}
+local KickMessage = "¡FUISTE SACADO POR STICK!"
+
+-- // VARIABLES ANTI SENTRY (LÓGICA)
+local DETECTION_DISTANCE = 60
+local PULL_DISTANCE = -5
+local sentryTarget = nil
+
+-- // VARIABLES ESP TIMER BASES
+local plotsFolder = workspace:FindFirstChild("Plots")
+local baseEspInstances = {}
+
+-- // FUNCIONES DE PERSISTENCIA
+local function savePos(file, pos)
+    local data = {x = pos.X.Scale, xO = pos.X.Offset, y = pos.Y.Scale, yO = pos.Y.Offset}
+    if writefile then writefile(file, HttpService:JSONEncode(data)) end
+end
+
+local function loadPos(file, default)
+    if isfile and isfile(file) then
+        local success, data = pcall(function() return HttpService:JSONDecode(readfile(file)) end)
+        if success then return UDim2.new(data.x, data.xO, data.y, data.yO) end
+    end
+    return default
+end
+
+local function saveState(file, state)
+    if writefile then writefile(file, HttpService:JSONEncode({enabled = state})) end
+end
+
+local function loadState(file, default)
+    if isfile and isfile(file) then
+        local success, data = pcall(function() return HttpService:JSONDecode(readfile(file)) end)
+        if success then return data.enabled end
+    end
+    return default
+end
+
+Enabled.AntiSentry = loadState(fileAntiSentry, false)
+
+-- Limpiar GUIs antiguas
+if CoreGui:FindFirstChild("StickFlashTP_Hub") then CoreGui:FindFirstChild("StickFlashTP_Hub"):Destroy() end
+if CoreGui:FindFirstChild("StickBoosterGui") then CoreGui:FindFirstChild("StickBoosterGui"):Destroy() end
+if CoreGui:FindFirstChild("StickHelperGui") then CoreGui:FindFirstChild("StickHelperGui"):Destroy() end
+if CoreGui:FindFirstChild("DesyncHybridGui") then CoreGui:FindFirstChild("DesyncHybridGui"):Destroy() end
+if CoreGui:FindFirstChild("StickMenuS_Gui") then CoreGui:FindFirstChild("StickMenuS_Gui"):Destroy() end
+
+-- // ---------------------------------------------------------
+-- // LÓGICA AUXILIAR
+-- // ---------------------------------------------------------
+local function InstantReset()
+    local char = Player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChild("Humanoid")
+    if hrp and hum then
+        hum.Health = 0
+        hum:ChangeState(Enum.HumanoidStateType.Dead)
+        task.delay(0.01, function()
+            pcall(function() Player:LoadCharacter() end)
+        end)
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if Players.RespawnTime ~= 0 then Players.RespawnTime = 0 end
+end)
+
+local function getWeapon()
+    local char = Player.Character
+    if not char then return nil end
+    return Player.Backpack:FindFirstChild("Bat") or char:FindFirstChild("Bat")
+end
+
+local function findSentry()
+    local char = Player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    local rootPos = char.HumanoidRootPart.Position
+    for _, obj in pairs(workspace:GetChildren()) do
+        if obj.Name:find("Sentry") and not obj.Name:lower():find("bullet") then
+            local ownerId = obj.Name:match("Sentry_(%d+)")
+            if ownerId and tonumber(ownerId) == Player.UserId then continue end
+            local part = obj:IsA("BasePart") and obj or obj:IsA("Model") and (obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart"))
+            if part and (rootPos - part.Position).Magnitude <= DETECTION_DISTANCE then
+                return obj
+            end
+        end
+    end
+end
+
+local function moveSentry(obj)
+    local char = Player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    for _, part in pairs(obj:GetDescendants()) do
+        if part:IsA("BasePart") then part.CanCollide = false end
+    end
+    local root = char.HumanoidRootPart
+    local cf = root.CFrame * CFrame.new(0, 0, PULL_DISTANCE)
+    if obj:IsA("BasePart") then
+        obj.CFrame = cf
+    elseif obj:IsA("Model") then
+        local main = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+        if main then main.CFrame = cf end
+    end
+end
+
+local function attackSentry()
+    local char = Player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local weapon = getWeapon()
+    if not hum or not weapon then return end
+    if weapon.Parent == Player.Backpack then hum:EquipTool(weapon) end
+    pcall(function() weapon:Activate() end)
+    for _, r in pairs(weapon:GetDescendants()) do
+        if r:IsA("RemoteEvent") then pcall(function() r:FireServer() end) end
+    end
+end
+
+-- // ESP BASES
+local function createBaseESP(plot, mainPart)
+    if baseEspInstances[plot.Name] then baseEspInstances[plot.Name]:Destroy() end
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "rznnq" .. plot.Name
+    billboard.Size = UDim2.new(0, 150, 0, 75)
+    billboard.StudsOffset = Vector3.new(0, 8, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Adornee = mainPart
+    billboard.MaxDistance = 2000
+    billboard.Parent = plot
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextScaled = true
+    label.Font = Enum.Font.Arcade
+    label.TextColor3 = Color3.fromRGB(0, 255, 0)
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.Parent = billboard
+    
+    baseEspInstances[plot.Name] = billboard
+    return billboard
+end
+
+local function updateBaseESP()
+    if not plotsFolder then return end
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        local purchases = plot:FindFirstChild("Purchases")
+        local plotBlock = purchases and purchases:FindFirstChild("PlotBlock")
+        local mainPart = plotBlock and plotBlock:FindFirstChild("Main")
+        local billboard = baseEspInstances[plot.Name]
+        local timeLabel = mainPart and mainPart:FindFirstChild("BillboardGui") and mainPart.BillboardGui:FindFirstChild("RemainingTime")
+
+        if timeLabel and mainPart then
+            billboard = billboard or createBaseESP(plot, mainPart)
+            local label = billboard:FindFirstChildWhichIsA("TextLabel")
+            if label then label.Text = timeLabel.Text end
+        elseif billboard then
+            billboard:Destroy()
+            baseEspInstances[plot.Name] = nil
+        end
+    end
+end
+RunService.RenderStepped:Connect(updateBaseESP)
+
+-- // ---------------------------------------------------------
+-- // GUI DESYNC + INSTA RESET HYBRID (VERDE)
+-- // ---------------------------------------------------------
+local function LoadDesyncHybridUI()
+    local screenGui = Instance.new("ScreenGui", CoreGui)
+    screenGui.Name = "DesyncHybridGui"
+    screenGui.ResetOnSpawn = false
+
+    local function saveHybridPos(pos)
+        local data = {
+            X_Scale = pos.X.Scale, X_Offset = pos.X.Offset,
+            Y_Scale = pos.Y.Scale, Y_Offset = pos.Y.Offset
+        }
+        if writefile then
+            pcall(function() writefile(fileDesyncHybrid, HttpService:JSONEncode(data)) end)
+        end
+    end
+
+    local function loadHybridPos()
+        if isfile and isfile(fileDesyncHybrid) then
+            local success, data = pcall(function() return HttpService:JSONDecode(readfile(fileDesyncHybrid)) end)
+            if success then return UDim2.new(data.X_Scale, data.X_Offset, data.Y_Scale, data.Y_Offset) end
+        end
+        return UDim2.new(0.5, -75, 0.5, -25)
+    end
+
+    local desyncBtn = Instance.new("TextButton", screenGui)
+    desyncBtn.Name = "DesyncButton"
+    desyncBtn.Size = UDim2.new(0, 150, 0, 50)
+    desyncBtn.Position = loadHybridPos()
+    desyncBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 100) -- COLOR VERDE
+    desyncBtn.BackgroundTransparency = 0.1
+    desyncBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    desyncBtn.Text = "DESYNC"
+    desyncBtn.Font = Enum.Font.GothamBold
+    desyncBtn.TextSize = 18
+    desyncBtn.AutoButtonColor = false
+
+    local corner = Instance.new("UICorner", desyncBtn)
+    corner.CornerRadius = UDim.new(0, 10)
+
+    local stroke = Instance.new("UIStroke", desyncBtn)
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.5
+
+    local dragging, dragInput, dragStart, startPos
+
+    desyncBtn.InputBegan:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = true
+            dragStart = input.Position
+            startPos = desyncBtn.Position
+            
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    saveHybridPos(desyncBtn.Position)
+                end
+            end)
+        end
+    end)
+
+    desyncBtn.InputChanged:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            dragInput = input
+        end
+    end)
+
+    RunService.RenderStepped:Connect(function()
+        if dragging and dragInput then
+            local delta = dragInput.Position - dragStart
+            desyncBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    local function equipCarpet()
+        local char = Player.Character
+        if not char then return end
+        local backpack = Player:FindFirstChild("Backpack")
+        if backpack then
+            for _, tool in ipairs(backpack:GetChildren()) do
+                if tool.Name:lower():find("carpet") then
+                    char:FindFirstChildOfClass("Humanoid"):EquipTool(tool)
+                    break
+                end
+            end
+        end
+    end
+
+    local function instaReset()
+        local char = Player.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChild("Humanoid")
+        
+        if hrp and hum then
+            equipCarpet()
+            task.wait()
+            hrp.CFrame = deathCoords
+            
+            local connection
+            connection = RunService.Heartbeat:Connect(function()
+                if not char or not char.Parent or hum.Health <= 0 then
+                    connection:Disconnect()
+                    return
+                end
+                hrp.CFrame = deathCoords
+            end)
+        end
+    end
+
+    desyncBtn.MouseButton1Click:Connect(function()
+        desyncBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 60)
+        desyncBtn.Text = "RESETTING..."
+        
+        pcall(function()
+            if raknet then raknet.desync(true) end
+        end)
+        
+        instaReset()
+        
+        task.wait(1.5)
+        desyncBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+        desyncBtn.Text = "DESYNC"
+    end)
+end
+
+-- // ---------------------------------------------------------
+-- // GUI BOTÓN "S" + STICK HELPER DENTRO
+-- // ---------------------------------------------------------
+local function LoadHelperWithSBtnUI()
+    -- Base de ScreenGuis
+    local MenuGui = Instance.new("ScreenGui", CoreGui)
+    MenuGui.Name = "StickMenuS_Gui"
+    MenuGui.ResetOnSpawn = false
+
+    local HelperGui = Instance.new("ScreenGui", CoreGui)
+    HelperGui.Name = "StickHelperGui"
+    HelperGui.ResetOnSpawn = false
+
+    -- BOTÓN "S" VERDE
+    local SButton = Instance.new("TextButton", MenuGui)
+    SButton.Name = "S_MenuButton"
+    SButton.Size = UDim2.new(0, 45, 0, 45)
+    SButton.Position = loadPos(fileMenuSBtn, UDim2.new(0, 10, 0.35, 0))
+    SButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+    SButton.Text = "S"
+    SButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SButton.Font = Enum.Font.GothamBold
+    SButton.TextSize = 22
+    SButton.Active = true
+    SButton.Draggable = true
+    Instance.new("UICorner", SButton).CornerRadius = UDim.new(1, 0) -- Redondo perfecto
+
+    local SStroke = Instance.new("UIStroke", SButton)
+    SStroke.Color = Color3.fromRGB(255, 255, 255)
+    SStroke.Thickness = 1.5
+    SStroke.Transparency = 0.3
+
+    -- Guardar posición del botón S al arrastrarlo
+    SButton.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            savePos(fileMenuSBtn, SButton.Position)
+        end
+    end)
+
+    -- PANEL PRINCIPAL DEL HELPER
+    local MainH = Instance.new("Frame", HelperGui)
+    MainH.Size = UDim2.new(0, 140, 0, 215)
+    MainH.Position = loadPos(fileHelper, UDim2.new(0, 65, 0.35, 0))
+    MainH.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+    MainH.Active = true
+    MainH.Draggable = true 
+    MainH.Visible = false -- Inicia oculto hasta presionar "S"
+    Instance.new("UICorner", MainH)
+
+    MainH.InputEnded:Connect(function(input) 
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+            savePos(fileHelper, MainH.Position) 
+        end 
+    end)
+
+    local StrokeH = Instance.new("UIStroke", MainH)
+    StrokeH.Color = Color3.fromRGB(0, 255, 120)
+    StrokeH.Thickness = 1.5
+
+    local TopBarH = Instance.new("Frame", MainH)
+    TopBarH.Size = UDim2.new(1, 0, 0, 30)
+    TopBarH.BackgroundTransparency = 1
+
+    local TitleH = Instance.new("TextLabel", TopBarH)
+    TitleH.Size = UDim2.new(1, -10, 1, 0)
+    TitleH.Position = UDim2.new(0, 10, 0, 0)
+    TitleH.Text = "STICK HELPER"
+    TitleH.TextColor3 = Color3.fromRGB(0, 255, 120)
+    TitleH.Font = Enum.Font.GothamBold
+    TitleH.BackgroundTransparency = 1
+    TitleH.TextSize = 12
+    TitleH.TextXAlignment = Enum.TextXAlignment.Left
+
+    local ContentH = Instance.new("Frame", MainH)
+    ContentH.Size = UDim2.new(1, 0, 1, -30)
+    ContentH.Position = UDim2.new(0, 0, 0, 30)
+    ContentH.BackgroundTransparency = 1
+
+    -- Alternar visibilidad con el botón S
+    SButton.MouseButton1Click:Connect(function()
+        MainH.Visible = not MainH.Visible
+        if MainH.Visible then
+            SButton.BackgroundColor3 = Color3.fromRGB(0, 130, 60) -- Color al estar abierto
+        else
+            SButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100) -- Color base verde
+        end
+    end)
+
+    local function createHelperBtn(text, pos, color)
+        local btn = Instance.new("TextButton", ContentH)
+        btn.Size = UDim2.new(0.85, 0, 0, 28)
+        btn.Position = pos
+        btn.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+        btn.Text = text
+        btn.TextColor3 = color or Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 9
+        Instance.new("UICorner", btn)
+        local s = Instance.new("UIStroke", btn)
+        s.Color = color or Color3.fromRGB(255, 255, 255)
+        return btn, s
+    end
+
+    local ToggleR, StrokeR = createHelperBtn(Enabled.AntiRagdoll and "ANTIRAGDOLL: ON" or "ANTIRAGDOLL: OFF", UDim2.new(0.075, 0, 0, 5), Enabled.AntiRagdoll and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255))
+    ToggleR.MouseButton1Click:Connect(function()
+        Enabled.AntiRagdoll = not Enabled.AntiRagdoll
+        ToggleR.Text = Enabled.AntiRagdoll and "ANTIRAGDOLL: ON" or "ANTIRAGDOLL: OFF"
+        ToggleR.TextColor3 = Enabled.AntiRagdoll and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+        StrokeR.Color = Enabled.AntiRagdoll and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+    end)
+
+    local ToggleS, StrokeS = createHelperBtn(Enabled.AntiSentry and "ANTI SENTRY: ON" or "ANTI SENTRY: OFF", UDim2.new(0.075, 0, 0, 40), Enabled.AntiSentry and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255))
+    ToggleS.MouseButton1Click:Connect(function()
+        Enabled.AntiSentry = not Enabled.AntiSentry
+        saveState(fileAntiSentry, Enabled.AntiSentry)
+        ToggleS.Text = Enabled.AntiSentry and "ANTI SENTRY: ON" or "ANTI SENTRY: OFF"
+        ToggleS.TextColor3 = Enabled.AntiSentry and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+        StrokeS.Color = Enabled.AntiSentry and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+        if not Enabled.AntiSentry then sentryTarget = nil end
+    end)
+
+    local ToggleAK, StrokeAK = createHelperBtn(Enabled.AutoKick and "AUTO-KICK: ON" or "AUTO-KICK: OFF", UDim2.new(0.075, 0, 0, 75), Enabled.AutoKick and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255))
+    ToggleAK.MouseButton1Click:Connect(function()
+        Enabled.AutoKick = not Enabled.AutoKick
+        ToggleAK.Text = Enabled.AutoKick and "AUTO-KICK: ON" or "AUTO-KICK: OFF"
+        ToggleAK.TextColor3 = Enabled.AutoKick and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+        StrokeAK.Color = Enabled.AutoKick and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(255, 255, 255)
+    end)
+
+    createHelperBtn("REJOIN SERVER", UDim2.new(0.075, 0, 0, 110), Color3.fromRGB(200, 200, 200)).MouseButton1Click:Connect(function() TeleportService:Teleport(game.PlaceId, Player) end)
+    createHelperBtn("KICK ME", UDim2.new(0.075, 0, 0, 145), Color3.fromRGB(255, 100, 100)).MouseButton1Click:Connect(function() Player:Kick(KickMessage) end)
+
+    Connections.MainLoop = RunService.Heartbeat:Connect(function()
+        if Enabled.AntiRagdoll then
+            local char = Player.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if hum and root then
+                local s = hum:GetState()
+                if s == Enum.HumanoidStateType.Physics or s == Enum.HumanoidStateType.Ragdoll or s == Enum.HumanoidStateType.FallingDown then
+                    pcall(function() Player:SetAttribute("RagdollEndTime", workspace:GetServerTimeNow()) end)
+                    for _, d in ipairs(char:GetDescendants()) do
+                        if d:IsA("BallSocketConstraint") or (d:IsA("Attachment") and d.Name:find("RagdollAttachment")) then d:Destroy() end
+                    end
+                    for _, obj in ipairs(char:GetDescendants()) do
+                        if obj:IsA("Motor6D") and obj.Enabled == false then obj.Enabled = true end
+                    end
+                    if hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Running) end
+                    workspace.CurrentCamera.CameraSubject = hum
+                    root.Anchored = false
+                end
+            end
+        end
+        if Enabled.AntiSentry then
+            if sentryTarget and sentryTarget.Parent == workspace then
+                moveSentry(sentryTarget)
+                attackSentry()
+            else
+                sentryTarget = findSentry()
+            end
+        end
+        if Enabled.AutoKick then
+            for _, v in ipairs(PlayerGui:GetDescendants()) do
+                if v:IsA("TextLabel") and v.Visible and v.TextTransparency < 0.5 then
+                    local txt = v.Text:lower()
+                    if txt:find("you stole") or txt:find("robaste") then Player:Kick(KickMessage) end
+                end
+            end
+        end
+    end)
+end
+
+-- // ---------------------------------------------------------
+-- // GUI PRINCIPAL (STICK FLASH TP)
+-- // ---------------------------------------------------------
+local function LoadFlashUI()
+    local ScreenGui = Instance.new("ScreenGui", CoreGui)
+    ScreenGui.Name = "StickFlashTP_Hub"
+
+    local minimized = loadState(fileFlashMin, false)
+
+    local BorderFrame = Instance.new("Frame", ScreenGui)
+    BorderFrame.Size = minimized and UDim2.new(0, 320, 0, 32) or UDim2.new(0, 320, 0, 160) 
+    BorderFrame.Position = loadPos(fileFlash, UDim2.new(0.5, -160, 0.4, 0))
+    BorderFrame.BackgroundColor3 = Color3.fromRGB(0, 20, 0) 
+    BorderFrame.Active = true
+    BorderFrame.Draggable = true
+    Instance.new("UICorner", BorderFrame).CornerRadius = UDim.new(0, 10)
+    BorderFrame.InputEnded:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then savePos(fileFlash, BorderFrame.Position) end end)
+    local BorderStroke = Instance.new("UIStroke", BorderFrame)
+    BorderStroke.Color = Color3.fromRGB(0, 255, 120)
+    BorderStroke.Thickness = 2
+    local UIGradient = Instance.new("UIGradient", BorderFrame)
+    UIGradient.Color = ColorSequence.new{ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 40, 10)), ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 10, 5))}
+    UIGradient.Rotation = 45
+    local TopBar = Instance.new("Frame", BorderFrame)
+    TopBar.Size = UDim2.new(1, 0, 0, 32)
+    TopBar.BackgroundTransparency = 1
+    local Title = Instance.new("TextLabel", TopBar)
+    Title.Size = UDim2.new(1, -40, 1, 0)
+    Title.Position = UDim2.new(0, 12, 0, 0)
+    Title.Text = "STICK FLASH TP"
+    Title.TextColor3 = Color3.fromRGB(0, 255, 150)
+    Title.Font = Enum.Font.Code
+    Title.TextSize = 14
+    Title.BackgroundTransparency = 1
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    local MinBtn = Instance.new("TextButton", TopBar)
+    MinBtn.Size = UDim2.new(0, 24, 0, 24)
+    MinBtn.Position = UDim2.new(1, -30, 0.5, -12)
+    MinBtn.Text = minimized and "+" or "×"
+    MinBtn.TextColor3 = Color3.fromRGB(0, 255, 150)
+    MinBtn.BackgroundColor3 = Color3.fromRGB(0, 50, 20)
+    MinBtn.Font = Enum.Font.GothamBold
+    MinBtn.TextSize = 18
+    Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 4)
+    local Content = Instance.new("Frame", BorderFrame)
+    Content.Size = UDim2.new(1, 0, 1, -32)
+    Content.Position = UDim2.new(0, 0, 0, 32)
+    Content.BackgroundTransparency = 1
+    Content.Visible = not minimized
+
+    local ToggleBtn = Instance.new("TextButton", Content)
+    ToggleBtn.Size = UDim2.new(0.9, 0, 0, 35)
+    ToggleBtn.Position = UDim2.new(0.05, 0, 0.05, 0)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 30, 10)
+    ToggleBtn.Text = flashEnabled and "AUTO FLASH: ON" or "AUTO FLASH: OFF"
+    ToggleBtn.TextColor3 = flashEnabled and Color3.fromRGB(0, 255, 120) or Color3.fromRGB(150, 150, 150)
+    ToggleBtn.Font = Enum.Font.GothamBold
+    ToggleBtn.TextSize = 12
+    local TogStroke = Instance.new("UIStroke", ToggleBtn)
+    TogStroke.Color = flashEnabled and Color3.fromRGB(0, 255, 120) or Color3.fromRGB(50, 50, 50)
+    Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 6)
+    local SliderContainer = Instance.new("Frame", Content)
+    SliderContainer.Size = UDim2.new(0.9, 0, 0, 50)
+    SliderContainer.Position = UDim2.new(0.05, 0, 0.45, 0)
+    SliderContainer.BackgroundTransparency = 1
+    local PercentLabel = Instance.new("TextLabel", SliderContainer)
+    PercentLabel.Size = UDim2.new(1, 0, 0, 20)
+    PercentLabel.Text = "TRIGGER SENSITIVITY: " .. math.floor(sliderValue * 100) .. "%"
+    PercentLabel.TextColor3 = Color3.fromRGB(0, 200, 100)
+    PercentLabel.Font = Enum.Font.Code
+    PercentLabel.TextSize = 11
+    PercentLabel.BackgroundTransparency = 1
+    local SliderTrack = Instance.new("Frame", SliderContainer)
+    SliderTrack.Size = UDim2.new(1, 0, 0, 6)
+    SliderTrack.Position = UDim2.new(0, 0, 0.7, 0)
+    SliderTrack.BackgroundColor3 = Color3.fromRGB(0, 40, 20)
+    Instance.new("UICorner", SliderTrack)
+    local SliderFill = Instance.new("Frame", SliderTrack)
+    SliderFill.Size = UDim2.new(sliderValue, 0, 1, 0)
+    SliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 120)
+    Instance.new("UICorner", SliderFill)
+    local Handle = Instance.new("Frame", SliderTrack)
+    Handle.Size = UDim2.new(0, 14, 0, 24)
+    Handle.AnchorPoint = Vector2.new(0.5, 0.5)
+    Handle.Position = UDim2.new(sliderValue, 0, 0.5, 0)
+    Handle.BackgroundColor3 = Color3.fromRGB(0, 255, 120)
+    Instance.new("UICorner", Handle).CornerRadius = UDim.new(0, 4)
+    Instance.new("UIStroke", Handle).Color = Color3.new(1, 1, 1)
+
+    local function ActualizarSlider(inputX)
+        local rel = math.clamp((inputX - SliderTrack.AbsolutePosition.X) / SliderTrack.AbsoluteSize.X, 0, 1)
+        sliderValue = rel
+        SliderFill.Size = UDim2.new(rel, 0, 1, 0)
+        Handle.Position = UDim2.new(rel, 0, 0.5, 0)
+        PercentLabel.Text = "TRIGGER SENSITIVITY: " .. math.floor(rel * 100) .. "%"
+    end
+
+    SliderTrack.InputBegan:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then draggingSlider = true BorderFrame.Draggable = false ActualizarSlider(i.Position.X) end end)
+    UIS.InputChanged:Connect(function(i) if draggingSlider and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then ActualizarSlider(i.Position.X) end end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then draggingSlider = false BorderFrame.Draggable = true end end)
+
+    ToggleBtn.MouseButton1Click:Connect(function()
+        flashEnabled = not flashEnabled
+        ToggleBtn.Text = flashEnabled and "AUTO FLASH: ON" or "AUTO FLASH: OFF"
+        ToggleBtn.TextColor3 = flashEnabled and Color3.fromRGB(0, 255, 120) or Color3.fromRGB(150, 150, 150)
+        TogStroke.Color = flashEnabled and Color3.fromRGB(0, 255, 120) or Color3.fromRGB(50, 50, 50)
+    end)
+
+    MinBtn.Activated:Connect(function()
+        minimized = not minimized
+        saveState(fileFlashMin, minimized)
+        Content.Visible = not minimized
+        MinBtn.Text = minimized and "+" or "×"
+        local targetSize = minimized and UDim2.new(0, 320, 0, 32) or UDim2.new(0, 320, 0, 160)
+        TweenService:Create(BorderFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = targetSize}):Play()
+    end)
+
+    ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt)
+        if not flashEnabled then return end
+        local startTime = os.clock()
+        local conn
+        conn = RunService.RenderStepped:Connect(function()
+            if not prompt or not prompt.Parent then conn:Disconnect() return end
+            if (os.clock() - startTime) / prompt.HoldDuration >= sliderValue then
+                conn:Disconnect()
+                local tool = Player.Character and Player.Character:FindFirstChildOfClass("Tool")
+                if tool then tool:Activate() end
+            end
+        end)
+        prompt.PromptButtonHoldEnded:Connect(function() if conn then conn:Disconnect() end end)
+    end)
+end
+
+-- // ---------------------------------------------------------
+-- // STICK BOOSTER
+-- // ---------------------------------------------------------
+local function LoadBoosterUI()
+    local BoosterGui = Instance.new("ScreenGui", CoreGui)
+    BoosterGui.Name = "StickBoosterGui"
+    local MainB = Instance.new("Frame", BoosterGui)
+    MainB.Size = UDim2.new(0, 140, 0, 110)
+    MainB.Position = UDim2.new(1, -153, 0.29, 0)
+    MainB.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    Instance.new("UICorner", MainB)
+    Instance.new("UIStroke", MainB).Color = Color3.fromRGB(0, 255, 120)
+    local TitleB = Instance.new("TextLabel", MainB)
+    TitleB.Size = UDim2.new(1, 0, 0, 25)
+    TitleB.Text = "STICK BOOSTER"
+    TitleB.TextColor3 = Color3.fromRGB(0, 255, 120)
+    TitleB.Font = Enum.Font.GothamBold
+    TitleB.BackgroundTransparency = 1
+    local SpeedBox = Instance.new("TextBox", MainB)
+    SpeedBox.Size = UDim2.new(1, -24, 0, 26)
+    SpeedBox.Position = UDim2.new(0, 12, 0, 35)
+    SpeedBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    SpeedBox.Text = tostring(SPEED)
+    SpeedBox.TextColor3 = Color3.new(1, 1, 1)
+    Instance.new("UICorner", SpeedBox)
+    SpeedBox:GetPropertyChangedSignal("Text"):Connect(function() SPEED = tonumber(SpeedBox.Text) or SPEED end)
+    local Toggle = Instance.new("Frame", MainB)
+    Toggle.Size = UDim2.new(0, 50, 0, 22)
+    Toggle.Position = UDim2.new(0.5, -25, 1, -30)
+    Toggle.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    Instance.new("UICorner", Toggle).CornerRadius = UDim.new(1, 0)
+    local Knob = Instance.new("Frame", Toggle)
+    Knob.Size = UDim2.new(0, 18, 0, 18)
+    Knob.Position = UDim2.new(0, 2, 0.5, -9)
+    Knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
+
+    Toggle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            boosterEnabled = not boosterEnabled
+            TweenService:Create(Knob, TweenInfo.new(0.2), {Position = boosterEnabled and UDim2.new(1, -20, 0.5, -9) or UDim2.new(0, 2, 0.5, -9)}):Play()
+            Toggle.BackgroundColor3 = boosterEnabled and Color3.fromRGB(0, 200, 80) or Color3.fromRGB(50, 50, 50)
+            if boosterEnabled then
+                speedConn = RunService.Heartbeat:Connect(function()
+                    if not boosterEnabled then return end
+                    local char = Player.Character
+                    local hum = char and char:FindFirstChildOfClass("Humanoid")
+                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    if hrp and hum and hum.MoveDirection.Magnitude > 0 then
+                        local vel = hum.MoveDirection * SPEED
+                        hrp.AssemblyLinearVelocity = Vector3.new(vel.X, hrp.AssemblyLinearVelocity.Y, vel.Z)
+                    end
+                end)
+            else
+                if speedConn then speedConn:Disconnect() speedConn = nil end
+            end
+        end
+    end)
+end
+
+-- // INPUTS GLOBALES
+UIS.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.R then InstantReset() end
+end)
+
+-- // INICIAR TODO
+LoadBoosterUI()
+LoadHelperWithSBtnUI()
+LoadFlashUI()
+LoadDesyncHybridUI()
